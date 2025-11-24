@@ -6,11 +6,11 @@ import random
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 import torch
 from scipy.spatial.transform import Rotation as R
 from PIL import Image
 from torchvision import transforms
-import traceback
 
 # Import model classes from training script
 import sys
@@ -18,8 +18,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Single_view_3D_Loss import DINOv3PoseEstimator, Research3Kinematics, IMAGE_RESOLUTION
 from confidence_utils import (
     decode_keypoints_with_confidence,
-    annotate_confidence_panel,
     filtered_joint_summary,
+    select_pnp_indices,
 )
 
 # Configuration
@@ -122,16 +122,14 @@ def solve_pnp_for_pose(points_3d_robot, points_2d_image, camera_matrix, dist_coe
 
     return rvec, tvec
 
-def project_to_pixel(coords_3d, rvec, tvec, camera_matrix, dist_coeffs=None):
-    """Project 3D coordinates to 2D image plane."""
-    if dist_coeffs is None:
-        dist_coeffs = np.zeros(5, dtype=np.float32)
+def transform_robot_to_camera(points_3d_robot, rvec, tvec):
+    """Transform 3D points from robot coordinates to camera coordinates."""
+    R_mat, _ = cv2.Rodrigues(rvec)
+    points_3d_camera = (R_mat @ points_3d_robot.T).T + tvec.reshape(1, 3)
+    return points_3d_camera
 
-    pixel_coords, _ = cv2.projectPoints(coords_3d, rvec, tvec, camera_matrix, dist_coeffs)
-    return pixel_coords.reshape(-1, 2)
-
-def visualize_prediction(json_path, model, device='cuda'):
-    """Visualize model prediction on a single DREAM sample."""
+def visualize_3d_prediction(json_path, model, device='cuda'):
+    """Visualize 3D model prediction on a single DREAM sample."""
     with open(json_path, 'r') as f:
         sample = json.load(f)
 
@@ -155,59 +153,85 @@ def visualize_prediction(json_path, model, device='cuda'):
 
     camera_matrix = np.array(sample['meta']['K'], dtype=np.float32)
     dist_coeffs = np.zeros(5, dtype=np.float32)
-    undistorted_img = img_rgb.copy()
 
-    max_joint = min(len(pred_kpts_2d_scaled), len(joint_coords_3d_robot))
-    visible_indices = [idx for idx in range(max_joint) if visibility[idx]]
-    if len(visible_indices) < 4:
-        pixel_coords_fk = None
+    selected_idx, used_fallback = select_pnp_indices(confidences, visibility, min_points=6, prefer_points=8)
+    if len(selected_idx) < 4:
+        pred_3d_camera = np.zeros_like(joint_coords_3d_robot)
     else:
-        limit = min(8, len(visible_indices))
-        selected_idx = visible_indices[:limit]
         pred_kpts_2d_for_pnp = pred_kpts_2d_scaled[selected_idx]
         joint_coords_3d_for_pnp = joint_coords_3d_robot[selected_idx]
         rvec, tvec = solve_pnp_for_pose(joint_coords_3d_for_pnp, pred_kpts_2d_for_pnp, camera_matrix, dist_coeffs)
-        pixel_coords_fk = project_to_pixel(joint_coords_3d_robot, rvec, tvec, camera_matrix, dist_coeffs)
+        pred_3d_camera = transform_robot_to_camera(joint_coords_3d_robot, rvec, tvec)
 
-    gt_kpts_2d = np.array([kp['projected_location'] for kp in sample['objects'][0]['keypoints']], dtype=np.float32)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    for idx, (x, y) in enumerate(gt_kpts_2d.astype(int)):
-        cv2.circle(undistorted_img, (x, y), 4, (0, 255, 255), -1)
-        if idx > 0: cv2.line(undistorted_img, tuple(gt_kpts_2d[idx-1].astype(int)), (x, y), (0, 255, 255), 1)
-
-    num_heatmap_keypoints = min(8, len(pred_kpts_2d_scaled))
-    prev_visible = None
-    for idx in range(num_heatmap_keypoints):
-        x, y = pred_kpts_2d_scaled[idx].astype(int)
-        label = f"P{idx}:{confidences[idx]:.2f}"
-        if visibility[idx]:
-            cv2.circle(undistorted_img, (x, y), 6, (0, 255, 0), -1)
-            if prev_visible is not None:
-                prev_point = pred_kpts_2d_scaled[prev_visible].astype(int)
-                cv2.line(undistorted_img, tuple(prev_point), (x, y), (0, 255, 0), 2)
-            cv2.putText(undistorted_img, label, (x + 6, y - 6), font, 0.45, (0, 255, 0), 1)
-            prev_visible = idx
-        else:
-            cv2.circle(undistorted_img, (x, y), 6, (0, 0, 255), 1)
-            cv2.line(undistorted_img, (x - 6, y - 6), (x + 6, y + 6), (0, 0, 255), 1)
-            cv2.line(undistorted_img, (x - 6, y + 6), (x + 6, y - 6), (0, 0, 255), 1)
-            cv2.putText(undistorted_img, f"{label}-DROP", (x + 6, y - 6), font, 0.4, (0, 0, 255), 1)
-
-    if pixel_coords_fk is not None:
-        for idx, (x, y) in enumerate(pixel_coords_fk.astype(int)):
-            cv2.circle(undistorted_img, (x, y), 8, (255, 0, 255), -1)
-            if idx > 0: cv2.line(undistorted_img, tuple(pixel_coords_fk[idx-1].astype(int)), (x, y), (255, 0, 255), 3)
-
-    undistorted_img = annotate_confidence_panel(undistorted_img, confidences, visibility)
+    # Get ground truth 3D points
+    gt_3d_camera = np.array([kp['location'] for kp in sample['objects'][0]['keypoints']], dtype=np.float32)
     summary = filtered_joint_summary(confidences, visibility)
-    return undistorted_img, summary
+    if used_fallback:
+        summary += " | PnP fallback (insufficient confident joints)"
+
+    return gt_3d_camera, pred_3d_camera, summary
+
+def plot_3d_comparison(ax, gt_3d, pred_3d, title):
+    """Plot 3D comparison of ground truth and predicted points."""
+    # Plot ground truth (blue)
+    ax.scatter(gt_3d[:, 0], gt_3d[:, 1], gt_3d[:, 2],
+               c='blue', marker='o', s=100, label='Ground Truth', alpha=0.6)
+
+    # Plot connections for ground truth
+    for i in range(len(gt_3d) - 1):
+        ax.plot([gt_3d[i, 0], gt_3d[i+1, 0]],
+                [gt_3d[i, 1], gt_3d[i+1, 1]],
+                [gt_3d[i, 2], gt_3d[i+1, 2]],
+                'b-', linewidth=2, alpha=0.4)
+
+    # Plot predicted (red)
+    ax.scatter(pred_3d[:, 0], pred_3d[:, 1], pred_3d[:, 2],
+               c='red', marker='^', s=100, label='Predicted', alpha=0.6)
+
+    # Plot connections for predicted
+    for i in range(len(pred_3d) - 1):
+        ax.plot([pred_3d[i, 0], pred_3d[i+1, 0]],
+                [pred_3d[i, 1], pred_3d[i+1, 1]],
+                [pred_3d[i, 2], pred_3d[i+1, 2]],
+                'r-', linewidth=2, alpha=0.4)
+
+    # Plot error lines (dashed lines connecting GT and predicted)
+    for i in range(min(len(gt_3d), len(pred_3d))):
+        ax.plot([gt_3d[i, 0], pred_3d[i, 0]],
+                [gt_3d[i, 1], pred_3d[i, 1]],
+                [gt_3d[i, 2], pred_3d[i, 2]],
+                'gray', linestyle='--', linewidth=1, alpha=0.3)
+
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title(title)
+    ax.legend()
+
+    # Set equal aspect ratio
+    all_points = np.vstack([gt_3d, pred_3d])
+    max_range = np.array([all_points[:, 0].max() - all_points[:, 0].min(),
+                          all_points[:, 1].max() - all_points[:, 1].min(),
+                          all_points[:, 2].max() - all_points[:, 2].min()]).max() / 2.0
+
+    mid_x = (all_points[:, 0].max() + all_points[:, 0].min()) * 0.5
+    mid_y = (all_points[:, 1].max() + all_points[:, 1].min()) * 0.5
+    mid_z = (all_points[:, 2].max() + all_points[:, 2].min()) * 0.5
+
+    ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    # Set viewing angle - base at bottom
+    # elev: elevation angle (view from above when positive)
+    # azim: azimuth angle (rotation around z-axis)
+    ax.view_init(elev=20, azim=45)
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = load_model(args.checkpoint, args.model_type, device)
 
-    print("DREAM Dataset Visualization\n" + "=" * 50)
+    print("DREAM Dataset 3D Visualization\n" + "=" * 50)
     selected_samples = []
     for dataset_name in DREAM_DATASETS:
         json_dir = os.path.join(DREAM_JSON_BASE, dataset_name)
@@ -225,25 +249,20 @@ def main(args):
 
     num_cols = 4
     num_rows = math.ceil(len(selected_samples) / num_cols)
-    fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 6, num_rows * 6))
-    axes = axes.flatten() if len(selected_samples) > 1 else [axes]
+    fig = plt.figure(figsize=(num_cols * 5, num_rows * 5))
 
     for i, (dataset_name, json_path) in enumerate(selected_samples):
-        ax = axes[i]
+        ax = fig.add_subplot(num_rows, num_cols, i + 1, projection='3d')
         try:
-            result_img, joint_summary = visualize_prediction(json_path, model, device)
-            ax.imshow(result_img)
-            ax.set_title(f"{dataset_name}\n{os.path.basename(json_path)}", fontsize=12)
+            gt_3d, pred_3d, joint_summary = visualize_3d_prediction(json_path, model, device)
+            plot_3d_comparison(ax, gt_3d, pred_3d,
+                             f"{dataset_name}\n{os.path.basename(json_path)}")
             print(f"{dataset_name}/{os.path.basename(json_path)} -> {joint_summary}")
         except Exception as e:
             print(f"Error processing {dataset_name}/{os.path.basename(json_path)}: {e}")
+            import traceback
             traceback.print_exc()
             ax.set_title(f"Error: {dataset_name}", color='red')
-        finally:
-            ax.axis("off")
-
-    for j in range(len(selected_samples), len(axes)):
-        axes[j].axis("off")
 
     plt.tight_layout()
     if args.output:
@@ -253,7 +272,7 @@ def main(args):
         plt.show()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Visualize DREAM dataset robot pose predictions")
+    parser = argparse.ArgumentParser(description="Visualize DREAM dataset robot pose predictions in 3D")
     parser.add_argument('--checkpoint', type=str, default=CHECKPOINT_PATH)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--model_type', type=str, default='dino_conv_only')

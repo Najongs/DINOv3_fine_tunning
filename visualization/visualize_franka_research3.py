@@ -16,7 +16,12 @@ import traceback
 # Import model classes from training script
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from Single_view_3D_Loss import DINOv3PoseEstimator, Research3Kinematics, get_max_preds
+from Single_view_3D_Loss import DINOv3PoseEstimator, Research3Kinematics, IMAGE_RESOLUTION
+from confidence_utils import (
+    decode_keypoints_with_confidence,
+    annotate_confidence_panel,
+    filtered_joint_summary,
+)
 
 # Configuration
 SYNC_CSV_PATH = "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/franka_research3/fr3_matched_joint_angle.csv"
@@ -78,7 +83,7 @@ def load_model(checkpoint_path, model_type, device='cuda'):
 def preprocess_image(image_path):
     """Preprocess image for model input."""
     transform = transforms.Compose([
-        transforms.Resize((512, 512)),
+        transforms.Resize(IMAGE_RESOLUTION),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -118,19 +123,9 @@ def visualize_prediction(image_path, model, aruco_result, calib_data, device='cu
     with torch.no_grad():
         pred_heatmaps, pred_angles = model(img_tensor)
 
-    # Extract 2D keypoints from heatmaps
-    pred_heatmaps_np = pred_heatmaps.cpu().numpy()
-    pred_kpts_2d, confidences = get_max_preds(pred_heatmaps_np)
-    pred_kpts_2d = pred_kpts_2d[0]  # First batch item
-
-    # Scale keypoints from heatmap size (224x224) to original image size
-    h, w = img_rgb.shape[:2]
-    heatmap_size = (224, 224)
-    scale_x = w / heatmap_size[0]
-    scale_y = h / heatmap_size[1]
-    pred_kpts_2d_scaled = pred_kpts_2d.copy()
-    pred_kpts_2d_scaled[:, 0] *= scale_x
-    pred_kpts_2d_scaled[:, 1] *= scale_y
+    pred_kpts_2d_scaled, confidences, visibility = decode_keypoints_with_confidence(
+        pred_heatmaps, img_rgb.shape
+    )
 
     # Get predicted angles (Research3 has 7 joints + 1 finger)
     pred_angles_np = pred_angles[0].cpu().numpy()[:8]  # Use first 8 joint angles
@@ -155,15 +150,24 @@ def visualize_prediction(image_path, model, aruco_result, calib_data, device='cu
     # Draw both predictions: heatmap-based (green) and FK-based (magenta)
     font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Draw heatmap-based predictions (green) - show all 8 keypoints (7 joints + 1 finger)
-    num_heatmap_keypoints = min(8, len(pred_kpts_2d_scaled))  # Research3 has 8 keypoints
+    # Draw heatmap-based predictions (green if kept, red if filtered)
+    num_heatmap_keypoints = min(8, len(pred_kpts_2d_scaled))
+    prev_visible = None
     for idx in range(num_heatmap_keypoints):
         x, y = pred_kpts_2d_scaled[idx].astype(int)
-        cv2.circle(undistorted_img, (x, y), 6, (0, 255, 0), -1)
-        cv2.putText(undistorted_img, f"H{idx}", (x + 10, y - 10), font, 0.5, (0, 255, 0), 1)
-        if idx > 0:
-            prev_x, prev_y = pred_kpts_2d_scaled[idx-1].astype(int)
-            cv2.line(undistorted_img, (prev_x, prev_y), (x, y), (0, 255, 0), 2)
+        label = f"H{idx}:{confidences[idx]:.2f}"
+        if visibility[idx]:
+            cv2.circle(undistorted_img, (x, y), 6, (0, 255, 0), -1)
+            cv2.putText(undistorted_img, label, (x + 10, y - 10), font, 0.45, (0, 255, 0), 1)
+            if prev_visible is not None:
+                prev_point = pred_kpts_2d_scaled[prev_visible].astype(int)
+                cv2.line(undistorted_img, (prev_point[0], prev_point[1]), (x, y), (0, 255, 0), 2)
+            prev_visible = idx
+        else:
+            cv2.circle(undistorted_img, (x, y), 6, (0, 0, 255), 1)
+            cv2.line(undistorted_img, (x - 6, y - 6), (x + 6, y + 6), (0, 0, 255), 1)
+            cv2.line(undistorted_img, (x - 6, y + 6), (x + 6, y - 6), (0, 0, 255), 1)
+            cv2.putText(undistorted_img, f"{label}-DROP", (x + 10, y - 10), font, 0.4, (0, 0, 255), 1)
 
     # Draw FK-based predictions (magenta)
     for idx, (x, y) in enumerate(pixel_coords_fk.astype(int)):
@@ -173,7 +177,9 @@ def visualize_prediction(image_path, model, aruco_result, calib_data, device='cu
             prev_x, prev_y = pixel_coords_fk[idx-1].astype(int)
             cv2.line(undistorted_img, (prev_x, prev_y), (x, y), (255, 0, 255), 3)
 
-    return undistorted_img
+    undistorted_img = annotate_confidence_panel(undistorted_img, confidences, visibility)
+    summary = filtered_joint_summary(confidences, visibility)
+    return undistorted_img, summary
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -272,10 +278,11 @@ def main(args):
                 calib_data = json.load(f)
 
             # Visualize prediction
-            result_img = visualize_prediction(image_path, model, aruco_result, calib_data, device)
+            result_img, joint_summary = visualize_prediction(image_path, model, aruco_result, calib_data, device)
 
             axes[i].imshow(result_img)
             axes[i].set_title(f"{view_str} / {cam_str}\n({pose_name})", fontsize=12)
+            print(f"{os.path.basename(image_path)} -> {joint_summary}")
             axes[i].axis("off")
 
         except StopIteration:

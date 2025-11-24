@@ -6,7 +6,7 @@
 set -e  # Exit on error
 
 # ===== Configuration =====
-DINOV3_MODEL_TYPE="${1:-dino_only}" # Default to dino_conv_only if no argument is provided
+DINOV3_MODEL_TYPE="${1:-siglip2_only}" # Default to dino_conv_only if no argument is provided
 CHECKPOINT_PATH="./checkpoints_total_${DINOV3_MODEL_TYPE}/best_model.pth"
 OUTPUT_DIR="results"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
