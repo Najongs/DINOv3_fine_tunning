@@ -15,7 +15,9 @@ from torchvision import transforms
 # Import model classes from training script
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from Single_view_3D_Loss import DINOv3PoseEstimator, MecaInsertionKinematics, IMAGE_RESOLUTION
+from model import DINOv3PoseEstimator
+from kinematics import MecaInsertionKinematics
+from dataset import IMAGE_RESOLUTION, HEATMAP_SIZE
 from confidence_utils import (
     decode_keypoints_with_confidence,
     annotate_confidence_panel,
@@ -57,7 +59,7 @@ def load_model(checkpoint_path, model_type, device='cuda'):
     else: # Default or combined
         dino_model_name = 'facebook/dinov3-vitb16-pretrain-lvd1689m' # Fallback for 'combined' or unknown
 
-    model = DINOv3PoseEstimator(dino_model_name=dino_model_name, ablation_mode=model_type)
+    model = DINOv3PoseEstimator(dino_model_name=dino_model_name, heatmap_size=HEATMAP_SIZE, ablation_mode=model_type)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if 'model_state_dict' in checkpoint:

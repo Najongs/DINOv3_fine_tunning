@@ -19,14 +19,14 @@ import torch.distributed as torch_dist
 from tqdm import tqdm
 
 from dataset import (
-    RobotPoseDataset,
+    RobotPoseSequenceDataset,
     KeypointOcclusionAugmentor,
-    robot_collate_fn,
+    robot_sequence_collate_fn,
     _scale_points,
     IMAGE_RESOLUTION,
     HEATMAP_SIZE
 )
-from model import DINOv3PoseEstimator
+from model import DINOv3MotionPoseEstimator
 from kinematics import get_robot_kinematics
 from utils import (
     setup_ddp,
@@ -45,20 +45,21 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 
 HEATMAP_CONF_THRESHOLD = 0.5
+SEQUENCE_LENGTH = 2
 
 # ======================= 메인 학습 함수 =======================
 def main(args): 
     rank, local_rank, world_size = setup_ddp()
     save_thread = None
     LEARNING_RATE = 1e-5
-    BATCH_SIZE = 32  # Per-GPU batch size (Total: 16 * world_size)
-    EPOCHS = 150
+    BATCH_SIZE = 16  # Per-GPU batch size, might need to be smaller due to sequence length
+    EPOCHS = 100
     VAL_RATIO = 0.1
     NUM_WORKERS = 4  # Per-GPU workers
 
     ablation_mode = args.ablation_mode
-    WANDB_PROJECT = f"DINOv3_Ablation_total_{ablation_mode}"
-    CHECKPOINT_DIR = f"checkpoints_total_{ablation_mode}"
+    WANDB_PROJECT = f"DINOv3_Motion_{ablation_mode}"
+    CHECKPOINT_DIR = f"checkpoints_motion_{ablation_mode}"
     CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
     LATEST_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pth")
     
@@ -77,7 +78,7 @@ def main(args):
     start_epoch = 0
     best_val_loss = float('inf')
 
-    model = DINOv3PoseEstimator(dino_model_name=MODEL_NAME, heatmap_size=HEATMAP_SIZE, ablation_mode=ablation_mode)
+    model = DINOv3MotionPoseEstimator(dino_model_name=MODEL_NAME, heatmap_size=HEATMAP_SIZE, ablation_mode=ablation_mode)
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank],
                 find_unused_parameters=False,
@@ -139,13 +140,14 @@ def main(args):
     if rank == 0:
         print(f"Found {len(json_files)} files.")
 
-    if len(json_files) < 2:
-        raise RuntimeError("Dataset must contain at least two samples to create train/val splits.")
+    if len(json_files) < SEQUENCE_LENGTH * 2:
+        raise RuntimeError(f"Dataset must contain at least {SEQUENCE_LENGTH*2} samples for sequences.")
 
+    # For sequence dataset, files MUST be sorted. Shuffling is handled by the sampler.
     json_files = sorted(json_files)
-    random.shuffle(json_files)
+    
+    # Splitting must happen before creating the dataset instance
     split_idx = int(len(json_files) * (1 - VAL_RATIO))
-    split_idx = min(max(split_idx, 1), len(json_files) - 1)
     train_files = json_files[:split_idx]
     val_files = json_files[split_idx:]
 
@@ -158,22 +160,22 @@ def main(args):
         occluded_confidence=0.15,
     )
 
-    train_dataset = RobotPoseDataset(train_files, transform, occlusion_augmentor=occlusion_augmentor)
-    val_dataset = RobotPoseDataset(val_files, transform)
+    train_dataset = RobotPoseSequenceDataset(train_files, transform, sequence_length=SEQUENCE_LENGTH, occlusion_augmentor=occlusion_augmentor)
+    val_dataset = RobotPoseSequenceDataset(val_files, transform, sequence_length=SEQUENCE_LENGTH)
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
-                              pin_memory=True, collate_fn=robot_collate_fn, sampler=train_sampler,
+                              pin_memory=True, collate_fn=robot_sequence_collate_fn, sampler=train_sampler,
                               persistent_workers=True if NUM_WORKERS > 0 else False)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
-                            pin_memory=True, collate_fn=robot_collate_fn, sampler=val_sampler,
+                            pin_memory=True, collate_fn=robot_sequence_collate_fn, sampler=val_sampler,
                             persistent_workers=True if NUM_WORKERS > 0 else False)
     
     if rank == 0:
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-        wandb.init(project=WANDB_PROJECT, name=f"run_total_{ablation_mode}", config={
+        wandb.init(project=WANDB_PROJECT, name=f"run_motion_{ablation_mode}", config={
             "base_learning_rate": LEARNING_RATE,
             "effective_learning_rate": effective_lr,
             "per_gpu_batch_size": BATCH_SIZE,
@@ -181,6 +183,7 @@ def main(args):
             "epochs": EPOCHS,
             "world_size": world_size,
             "num_workers": NUM_WORKERS,
+            "sequence_length": SEQUENCE_LENGTH,
             "ablation_mode": ablation_mode
         }, resume="allow")
 
@@ -193,10 +196,12 @@ def main(args):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", disable=(rank != 0))
         for batch in pbar:
-            (images, gt_heatmaps, gt_angles, gt_class, gt_3d_points_padded, K, dist, 
+            if batch is None: # handle invalid batches from collate_fn
+                continue
+            (image_sequences, gt_heatmaps, gt_angles, gt_class, gt_3d_points_padded, K, dist, 
              joint_lengths, angle_lengths, point_lengths, orig_img_sizes, joint_confidences) = batch
 
-            images      = images.to(local_rank)
+            image_sequences = image_sequences.to(local_rank)
             gt_heatmaps = gt_heatmaps.to(local_rank)
             gt_angles   = gt_angles.to(local_rank)
             gt_3d       = gt_3d_points_padded.to(local_rank)
@@ -211,7 +216,7 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda'):
-                pred_heatmaps, pred_angles = model(images)
+                pred_heatmaps, pred_angles = model(image_sequences)
 
             pred_heatmaps_np = pred_heatmaps.detach().cpu().numpy()
             pred_kpts_heatmap, pred_heatmap_conf = get_max_preds(pred_heatmaps_np)
@@ -222,7 +227,7 @@ def main(args):
             pred_visibility_np = pred_visibility_mask.detach().cpu().numpy()
 
             pred_3d_list = []
-            for s in range(images.size(0)):
+            for s in range(image_sequences.size(0)):
                 robot = get_robot_kinematics(gt_class[s])
                 joint_angles = robot._truncate_angles(pred_angles[s].detach().cpu().numpy())
                 joint_coords_robot = robot.forward_kinematics(joint_angles)
@@ -246,7 +251,7 @@ def main(args):
                 except Exception:
                     joint_coords_cam = np.zeros_like(joint_coords_robot)
 
-                pred_3d_list.append(torch.tensor(joint_coords_cam, device=images.device))
+                pred_3d_list.append(torch.tensor(joint_coords_cam, device=image_sequences.device))
 
             padded_pred_3d_list = []
             max_len = gt_3d.shape[1]
@@ -287,10 +292,12 @@ def main(args):
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Val]", disable=(rank != 0))
             for batch in val_pbar:
-                (images, gt_heatmaps, gt_angles, gt_class, gt_3d_points_padded, K, dist, 
+                if batch is None:
+                    continue
+                (image_sequences, gt_heatmaps, gt_angles, gt_class, gt_3d_points_padded, K, dist, 
                  joint_lengths, angle_lengths, point_lengths, orig_img_sizes, joint_confidences) = batch
 
-                images      = images.to(local_rank)
+                image_sequences = image_sequences.to(local_rank)
                 gt_heatmaps = gt_heatmaps.to(local_rank)
                 gt_angles   = gt_angles.to(local_rank)
                 gt_3d       = gt_3d_points_padded.to(local_rank)
@@ -303,7 +310,7 @@ def main(args):
                 joint_confidences = joint_confidences.to(local_rank)
 
                 with torch.amp.autocast('cuda'):
-                    pred_heatmaps, pred_angles = model(images)
+                    pred_heatmaps, pred_angles = model(image_sequences)
 
                 pred_heatmaps_np = pred_heatmaps.detach().cpu().numpy()
                 pred_kpts_heatmap, pred_heatmap_conf = get_max_preds(pred_heatmaps_np)
@@ -314,7 +321,7 @@ def main(args):
                 pred_visibility_np = pred_visibility_mask.detach().cpu().numpy()
 
                 pred_3d_list = []
-                for s in range(images.size(0)):
+                for s in range(image_sequences.size(0)):
                     robot = get_robot_kinematics(gt_class[s])
                     joint_angles = robot._truncate_angles(pred_angles[s].detach().cpu().numpy())
                     joint_coords_robot = robot.forward_kinematics(joint_angles)
@@ -338,7 +345,7 @@ def main(args):
                     except Exception:
                         joint_coords_cam = np.zeros_like(joint_coords_robot)
 
-                    pred_3d_list.append(torch.tensor(joint_coords_cam, device=images.device))
+                    pred_3d_list.append(torch.tensor(joint_coords_cam, device=image_sequences.device))
 
                 padded_pred_3d_list = []
                 max_len = gt_3d.shape[1]
@@ -418,7 +425,7 @@ def main(args):
     cleanup_ddp()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="DINOv3 Pose Estimation Ablation Study")
+    parser = argparse.ArgumentParser(description="DINOv3 Motion Pose Estimation Training")
     parser.add_argument(
         '--ablation_mode',
         type=str,

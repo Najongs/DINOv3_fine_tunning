@@ -188,3 +188,131 @@ class DINOv3PoseEstimator(nn.Module):
         predicted_angles = self.angle_head(dino_features)
         
         return predicted_heatmaps, predicted_angles
+
+class DINOv3MotionPoseEstimator(nn.Module):
+    def __init__(self, dino_model_name, heatmap_size, ablation_mode=None):
+        super().__init__()
+        self.dino_model_name = dino_model_name
+        self.backbone = DINOv3Backbone(dino_model_name)
+        
+        if "siglip" in self.dino_model_name:
+            config = self.backbone.model.config
+            feature_dim = config.hidden_size
+        else: # DINOv3 계열
+            config = self.backbone.model.config
+            feature_dim = config.hidden_sizes[-1] if "conv" in self.dino_model_name else config.hidden_size
+
+        self.temporal_processor = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=feature_dim,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        self.cnn_stem = LightCNNStem()
+        self.keypoint_head = UNetViTKeypointHead(input_dim=feature_dim, heatmap_size=heatmap_size)
+        self.angle_head = JointAngleHead(input_dim=feature_dim)
+        
+    def forward(self, image_sequence_batch):
+        b, t, c, h, w = image_sequence_batch.shape
+        
+        # 1. Reshape for backbone processing
+        reshaped_images = image_sequence_batch.reshape(b * t, c, h, w)
+        
+        # 2. Extract DINO features for all images in the sequence
+        dino_features = self.backbone(reshaped_images) # (B*T, N, D)
+        
+        # 3. Process features temporally with LSTM
+        _bt, n, d = dino_features.shape
+        # We process each patch token's sequence over time
+        # Reshape so that time is the sequence length for the LSTM
+        dino_features_temporal = dino_features.view(b, t, n, d).permute(0, 2, 1, 3).reshape(b * n, t, d)
+        
+        lstm_out, _ = self.temporal_processor(dino_features_temporal) # (B*N, T, D)
+        
+        # Get the output of the last time step
+        last_step_features = lstm_out[:, -1, :] # (B*N, D)
+        
+        # Reshape back to (B, N, D) for the prediction heads
+        temporal_context_features = last_step_features.reshape(b, n, d)
+
+        # 4. Extract CNN features for the *last* frame only (for skip connections)
+        last_frame_image = image_sequence_batch[:, -1, :, :, :]
+        cnn_stem_features = self.cnn_stem(last_frame_image)
+        
+        # 5. Predict using the temporally-aware features
+        predicted_heatmaps = self.keypoint_head(temporal_context_features, cnn_stem_features)
+        predicted_angles = self.angle_head(temporal_context_features)
+        
+        return predicted_heatmaps, predicted_angles
+
+
+class DINOv3MotionVectorEstimator(nn.Module):
+    """
+    Estimator that predicts both the current pose (heatmaps, angles) and 
+    the motion vector (change in angles) for the next time step.
+    """
+    def __init__(self, dino_model_name, heatmap_size, ablation_mode=None):
+        super().__init__()
+        self.dino_model_name = dino_model_name
+        self.backbone = DINOv3Backbone(dino_model_name)
+        
+        if "siglip" in self.dino_model_name:
+            config = self.backbone.model.config
+            feature_dim = config.hidden_size
+        else: # DINOv3 계열
+            config = self.backbone.model.config
+            feature_dim = config.hidden_sizes[-1] if "conv" in self.dino_model_name else config.hidden_size
+
+        self.temporal_processor = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=feature_dim,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        self.cnn_stem = LightCNNStem()
+        self.keypoint_head = UNetViTKeypointHead(input_dim=feature_dim, heatmap_size=heatmap_size)
+        self.angle_head = JointAngleHead(input_dim=feature_dim)
+        
+        # New head for predicting the motion vector (angle deltas)
+        self.angle_delta_head = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, 512),
+            nn.GELU(),
+            nn.LayerNorm(512),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, NUM_ANGLES)
+        )
+        
+    def forward(self, image_sequence_batch):
+        b, t, c, h, w = image_sequence_batch.shape
+        
+        reshaped_images = image_sequence_batch.reshape(b * t, c, h, w)
+        dino_features = self.backbone(reshaped_images)
+        
+        _bt, n, d = dino_features.shape
+        dino_features_temporal = dino_features.view(b, t, n, d).permute(0, 2, 1, 3).reshape(b * n, t, d)
+        
+        lstm_out, _ = self.temporal_processor(dino_features_temporal)
+        
+        last_step_features = lstm_out[:, -1, :]
+        
+        temporal_context_features = last_step_features.reshape(b, n, d)
+
+        last_frame_image = image_sequence_batch[:, -1, :, :, :]
+        cnn_stem_features = self.cnn_stem(last_frame_image)
+        
+        # Predict current pose (t)
+        predicted_heatmaps = self.keypoint_head(temporal_context_features, cnn_stem_features)
+        predicted_angles = self.angle_head(temporal_context_features)
+        
+        # Predict motion vector (t -> t+1)
+        # We use the globally pooled features from the temporal context for delta prediction
+        pooled_temporal_features = temporal_context_features.mean(dim=1) # (B, D)
+        predicted_angle_deltas = self.angle_delta_head(pooled_temporal_features)
+        
+        return predicted_heatmaps, predicted_angles, predicted_angle_deltas
