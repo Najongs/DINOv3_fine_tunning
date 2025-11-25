@@ -150,7 +150,7 @@ def main(args):
     val_files = json_files[split_idx:]
 
     occlusion_augmentor = KeypointOcclusionAugmentor(
-        prob=0.45,
+        prob=0.1,
         min_occlusions=1,
         max_occlusions=3,
         min_patch_ratio=0.06,
@@ -418,6 +418,8 @@ def main(args):
     cleanup_ddp()
 
 if __name__ == '__main__':
+    print(torch.cuda.is_available())
+    print(torch.version.cuda)
     parser = argparse.ArgumentParser(description="DINOv3 Pose Estimation Ablation Study")
     parser.add_argument(
         '--ablation_mode',
