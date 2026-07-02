@@ -22,6 +22,7 @@ from confidence_utils import (
     decode_keypoints_with_confidence,
     annotate_confidence_panel,
     filtered_joint_summary,
+    select_pnp_indices,
 )
 
 # Configuration
@@ -160,12 +161,18 @@ def visualize_prediction(json_path, model, device='cuda'):
     undistorted_img = img_rgb.copy()
 
     max_joint = min(len(pred_kpts_2d_scaled), len(joint_coords_3d_robot))
-    visible_indices = [idx for idx in range(max_joint) if visibility[idx]]
-    if len(visible_indices) < 4:
+    # Use select_pnp_indices to get best available points (visible or high-confidence)
+    selected_idx, used_fallback = select_pnp_indices(
+        confidences[:max_joint],
+        visibility[:max_joint],
+        min_points=6,
+        prefer_points=8
+    )
+
+    if len(selected_idx) < 6:
+        # Not enough points for PnP
         pixel_coords_fk = None
     else:
-        limit = min(8, len(visible_indices))
-        selected_idx = visible_indices[:limit]
         pred_kpts_2d_for_pnp = pred_kpts_2d_scaled[selected_idx]
         joint_coords_3d_for_pnp = joint_coords_3d_robot[selected_idx]
         rvec, tvec = solve_pnp_for_pose(joint_coords_3d_for_pnp, pred_kpts_2d_for_pnp, camera_matrix, dist_coeffs)

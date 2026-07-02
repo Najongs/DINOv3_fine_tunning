@@ -142,7 +142,7 @@ def visualize_3d_prediction(json_path, model, device='cuda'):
 
     selected_idx, used_fallback = select_pnp_indices(confidences, visibility, min_points=6, prefer_points=6)
 
-    if len(selected_idx) < 4:
+    if len(selected_idx) < 6:
         pred_3d_camera = np.zeros_like(joint_coords_3d_robot)
     else:
         pred_kpts_2d_for_pnp = pred_kpts_2d_scaled[selected_idx]

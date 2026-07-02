@@ -11,8 +11,9 @@ from torch.utils.data import Dataset
 # Dataset Root
 DATASET_ROOT = "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset"
 DREAM_DATASET_PATH = "/home/najo/NAS/DIP/2025_ICRA_Multi_View_Robot_Pose_Estimation/dataset/Converted_dataset/DREAM_to_DREAM"
-IMAGE_RESOLUTION = (640, 360)
-HEATMAP_SIZE = (640, 360)
+# Use (H, W) ordering for torchvision.Resize; keep landscape (width>height)
+IMAGE_RESOLUTION = (512, 512)
+HEATMAP_SIZE = (512, 512)
 
 
 def create_gt_heatmap(keypoint_2d, heatmap_size, sigma):

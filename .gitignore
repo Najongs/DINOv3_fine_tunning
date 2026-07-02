@@ -18,7 +18,10 @@ __pycache__/
 *.csv
 .claude/
 checkpoints*/
-
+Depth-Anything-3/
+logs/
+coco_dataset/
+*_npy/
 dinov3/
 DINOv3/
 wandb/

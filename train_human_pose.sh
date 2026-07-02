@@ -7,14 +7,14 @@
 # Configuration
 # =========================
 
-# Dataset paths (MODIFY THESE TO YOUR ACTUAL PATHS)
-TRAIN_IMAGE_DIR="/path/to/coco/images/train2017"
-TRAIN_ANNOTATION="/path/to/coco/annotations/person_keypoints_train2017.json"
-VAL_IMAGE_DIR="/path/to/coco/images/val2017"
-VAL_ANNOTATION="/path/to/coco/annotations/person_keypoints_val2017.json"
+# Dataset paths
+TRAIN_IMAGE_DIR="/home/najo/NAS/DIP/DINOv3_fine_tunning/coco_dataset/train2017"
+TRAIN_ANNOTATION="/home/najo/NAS/DIP/DINOv3_fine_tunning/coco_dataset/annotations/person_keypoints_train2017.json"
+VAL_IMAGE_DIR="/home/najo/NAS/DIP/DINOv3_fine_tunning/coco_dataset/val2017"
+VAL_ANNOTATION="/home/najo/NAS/DIP/DINOv3_fine_tunning/coco_dataset/annotations/person_keypoints_val2017.json"
 
 # Model configuration
-MODEL_NAME="facebook/dinov2-base"  # Options: facebook/dinov2-base, facebook/dinov2-large, facebook/dinov2-giant
+MODEL_NAME="facebook/dinov3-vitb16-pretrain-lvd1689m"
 IMAGE_SIZE="512 512"  # Height Width
 HEATMAP_SIZE="512 512"  # Height Width
 
@@ -33,9 +33,12 @@ WANDB_RUN_NAME="human_pose_dinov2_base"
 # Multi-GPU Training
 # =========================
 
-# Get number of available GPUs
-NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
-echo "Found ${NUM_GPUS} GPUs"
+# Set which GPUs to use (0,1,2,3,4 for all 5 GPUs, or 0,1,2,3 for 4 GPUs)
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4
+
+# Get number of available GPUs (using PyTorch to respect CUDA_VISIBLE_DEVICES)
+NUM_GPUS=$($HOME/.conda/envs/dinov3/bin/python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "1")
+echo "Found ${NUM_GPUS} GPUs available for PyTorch"
 
 # Run distributed training
 torchrun \
